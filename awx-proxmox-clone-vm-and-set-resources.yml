@@ -37,7 +37,7 @@
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
       api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
       api_host: "{{ proxmox_env_info.api_host }}"
-      api_port: "{{ proxmox_env_info.api_port }}"
+      api_port: "{{ proxmox_env_info.api_port | default(8006) }}"
       clone: "{{ vm_config['template'] }}"
       vmid: "{{ vm_config['template'] }}"
       name: "{{ vm_config['name'] }}"
