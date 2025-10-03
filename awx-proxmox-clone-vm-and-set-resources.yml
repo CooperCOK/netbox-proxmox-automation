@@ -39,7 +39,7 @@
       api_host: "{{ proxmox_env_info.api_host }}"
       api_port: "{{ proxmox_env_info.api_port | default(8006) }}"
       clone: "{{ vm_config['template'] }}"
-      vmid: "{{ vm_config['template'] }}"
+      vmid: "{{ vm_config['template'] | int }}"
       name: "{{ vm_config['name'] }}"
       newid: "{{ vm_config['vmid'] | int | default(omit) }}"
       agent: 'enabled=1'
