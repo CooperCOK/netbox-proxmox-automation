@@ -18,6 +18,7 @@
 
   - name: Start specified VM
     community.proxmox.proxmox_kvm:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       #node: "{{ proxmox_env_info.node }}"
       node: "{{ vm_config['node'] }}"
       api_user: "{{ proxmox_env_info.api_user }}"
@@ -43,6 +44,7 @@
 
   - name: Discover Proxmox started VM on node
     community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       api_host: "{{ proxmox_env_info.api_host | default(omit) }}"
       api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
       api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"

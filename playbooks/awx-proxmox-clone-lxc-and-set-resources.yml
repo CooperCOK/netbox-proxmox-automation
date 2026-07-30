@@ -34,6 +34,7 @@
 
   - name: Create LXC (Container) from a template
     community.proxmox.proxmox:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       node: "{{ proxmox_env_info.node }}"
       api_user: "{{ proxmox_env_info.api_user }}"
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
@@ -77,6 +78,7 @@
 
   - name: "Discover information for newly-created Proxmox LXC"
     community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       api_host: "{{ proxmox_env_info.api_host | default(omit) }}"
       api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
       api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"

@@ -1,18 +1,52 @@
+# ---------------------------------------------------------------------------
+# LOKALE ANPASSUNG gegenueber upstream (netboxlabs).
+#
+# Upstream ermittelt die zu durchsuchenden Nodes ueber
+# proxmox_cluster_join_info, setzt also einen Proxmox-CLUSTER voraus.
+# Auf einem Standalone-Host antwortet die API mit HTTP 424:
+#   {"data":null,"message":"node is not in a cluster, no join info available!"}
+# Danach laeuft die Schleife ueber cluster_join.nodelist ins Leere und die
+# gesamte VM-Discovery scheitert.
+#
+# Diese Fassung funktioniert in BEIDEN Faellen:
+#   - Cluster:    Nodeliste kommt wie bisher aus proxmox_cluster_join_info
+#   - Standalone: Rueckfall auf den einzelnen Node aus proxmox_env_info
+#
+# Verifiziert am 2026-07-30 gegen STR1-0005-AH01 (PVE 9.2.4, kein Cluster).
+# ---------------------------------------------------------------------------
+
   - name: List existing Proxmox VE cluster join information
     community.proxmox.proxmox_cluster_join_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       api_host: "{{ proxmox_env_info.api_host | default(omit) }}"
       api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
       api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"
       api_token_secret: "{{ proxmox_env_info.api_token_secret | default(omit) }}"
     register: proxmox_cluster_join
+    # Standalone-Hosts liefern hier HTTP 424 - das ist kein Fehler, sondern
+    # der Normalfall ohne Cluster. Deshalb nicht abbrechen.
+    failed_when: false
 
-  - name: Collect name/IP information about each node
+  - name: Collect name/IP information about each node (Cluster)
     set_fact:
       proxmox_node_info: "{{ proxmox_node_info | combine({item.name: item.pve_addr}) }}"
-    loop: "{{ proxmox_cluster_join.cluster_join.nodelist }}"
+    loop: "{{ proxmox_cluster_join.cluster_join.nodelist | default([]) }}"
+
+  - name: Fall back to single node (Standalone ohne Cluster)
+    set_fact:
+      proxmox_node_info: "{{ {proxmox_env_info.node: proxmox_env_info.api_host} }}"
+    when: proxmox_node_info | length == 0
+
+  - name: Fail if no node could be determined
+    fail:
+      msg: >-
+        Weder Cluster-Nodeliste noch proxmox_env_info.node/api_host verfuegbar.
+        Ohne Node kann keine VM-Discovery stattfinden.
+    when: proxmox_node_info | length == 0
 
   - name: Discover all existing virtual machines on node(s)
     community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       api_host: "{{ item.value | default(omit) }}"
       api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
       api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"
@@ -32,4 +66,3 @@
       collected_proxmox_vm: "{{ collected_proxmox_vm | combine({item.name: item.vmid}) }}"
     loop: "{{ collected_proxmox_vms }}"
     when: not item.template
-

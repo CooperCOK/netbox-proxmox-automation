@@ -18,6 +18,7 @@
 
   - name: "Grow LXC disk"
     community.proxmox.proxmox:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       #node: "{{ proxmox_env_info.node }}"
       node: "{{ vm_config['node'] }}"
       api_user: "{{ proxmox_env_info.api_user }}"

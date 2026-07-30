@@ -10,6 +10,7 @@
 
   - name: Migrate specified VM
     community.proxmox.proxmox_kvm:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       api_user: "{{ proxmox_env_info.api_user }}"
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
       api_token_secret: "{{ proxmox_env_info.api_token_secret }}"

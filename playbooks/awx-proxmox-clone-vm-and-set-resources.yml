@@ -34,6 +34,7 @@
 
   - name: Create VM from a full clone of template
     community.proxmox.proxmox_kvm:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       node: "{{ proxmox_env_info.node }}"
       target: "{{ vm_config['node']}}"
       api_user: "{{ proxmox_env_info.api_user }}"
@@ -66,6 +67,7 @@
 
   - name: Update Proxmox VMs resource settings
     community.proxmox.proxmox_kvm:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       node: "{{ vm_config['node'] }}"
       api_user: "{{ proxmox_env_info.api_user }}"
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
@@ -91,6 +93,7 @@
 
   - name: "Discover information for newly-created Proxmox VM"
     community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
       #api_host: "{{ proxmox_env_info.api_host | default(omit) }}"
       api_host: "{{ vm_config['node'] }}"
       api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
