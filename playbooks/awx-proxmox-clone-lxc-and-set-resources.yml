@@ -40,7 +40,8 @@
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
       api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
       api_host: "{{ proxmox_env_info.api_host }}"
-      api_port: "{{ proxmox_env_info.api_port }}"
+      # api_port kommt aus unserer AWX-Credential nicht - Modul-Standard (8006) nutzen
+      api_port: "{{ proxmox_env_info.api_port | default(omit) }}"
       ostemplate: "{{ vm_config ['template'] }}"
       #vmid: "{{ vm_config['template'] }}"
       vmid: "{{ vm_config['vmid'] | int | default(omit) }}"
