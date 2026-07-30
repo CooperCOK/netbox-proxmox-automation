@@ -92,6 +92,28 @@
     retries: 60
     delay: 10
 
+  # ---------------------------------------------------------------------------
+  # Erst-Passwort fuer cloud-init setzen.
+  #
+  # Proxmox' Clone-Aufruf nimmt cipassword nicht entgegen - es muss per Update
+  # nachgezogen werden. Deshalb hier als eigener Schritt nach dem Klonen.
+  #
+  # no_log verhindert, dass das Passwort im AWX-Job-Log erscheint.
+  # ---------------------------------------------------------------------------
+  - name: Set the initial cloud-init admin password
+    community.proxmox.proxmox_kvm:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
+      node: "{{ vm_config['node'] }}"
+      api_user: "{{ proxmox_env_info.api_user }}"
+      api_token_id: "{{ proxmox_env_info.api_token_id }}"
+      api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
+      api_host: "{{ vm_config['node'] }}"
+      name: "{{ vm_config['name'] }}"
+      cipassword: "{{ vm_config['initial_admin_password'] }}"
+      update: true
+    no_log: true
+    when: (vm_config['initial_admin_password'] | default('')) | length > 0
+
   - name: "Discover information for newly-created Proxmox VM"
     community.proxmox.proxmox_vm_info:
       validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
@@ -138,3 +160,58 @@
           proxmox_disk_storage_volume: "{{ vm_config['storage'] }}"
       state: present
     when: new_proxmox_vm is defined and new_proxmox_vm.proxmox_vms is defined and new_proxmox_vm.proxmox_vms | length > 0
+
+  # ---------------------------------------------------------------------------
+  # Erst-Passwort in NetBox wieder leeren.
+  #
+  # ACHTUNG: Das entfernt den Wert nur aus dem aktuellen Objekt. NetBox
+  # protokolliert Custom Fields im Changelog (prechange_data/postchange_data) -
+  # dort bleibt das Passwort lesbar, bis das Protokoll bereinigt wird. Das
+  # Leeren ist also Hygiene, kein Schutz.
+  #
+  # Bewusst per uri/PATCH statt ueber netbox_virtual_machine: PATCH aktualisiert
+  # in NetBox nur die uebergebenen Custom Fields. Die Kontrolle danach sichert
+  # ab, dass proxmox_node dabei erhalten bleibt - ginge es verloren, wuerden
+  # alle spaeteren Disk-Operationen an dieser VM scheitern.
+  # ---------------------------------------------------------------------------
+  - name: Look up the VM in NetBox
+    ansible.builtin.uri:
+      url: >-
+        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-machines/?name={{ vm_config['name'] | urlencode }}
+      headers:
+        Authorization: "Token {{ netbox_env_info.api_token }}"
+        Accept: "application/json"
+      validate_certs: false
+    register: nb_vm_for_pw
+    when: (vm_config['initial_admin_password'] | default('')) | length > 0
+
+  - name: Clear the initial admin password in NetBox
+    ansible.builtin.uri:
+      url: >-
+        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-machines/{{ nb_vm_for_pw.json.results[0].id }}/
+      method: PATCH
+      body_format: json
+      body:
+        custom_fields:
+          proxmox_initial_admin_password: ""
+      headers:
+        Authorization: "Token {{ netbox_env_info.api_token }}"
+        Accept: "application/json"
+      status_code: 200
+      validate_certs: false
+    register: nb_pw_cleared
+    when:
+      - (vm_config['initial_admin_password'] | default('')) | length > 0
+      - nb_vm_for_pw.json.count | int > 0
+
+  - name: Verify that clearing the password did not wipe other custom fields
+    ansible.builtin.fail:
+      msg: >-
+        Beim Leeren von proxmox_initial_admin_password ist proxmox_node
+        verlorengegangen. NetBox hat die Custom Fields offenbar ersetzt statt
+        zusammengefuehrt. Ohne proxmox_node scheitern alle spaeteren
+        Disk-Operationen an dieser VM - bitte den Wert wiederherstellen.
+    when:
+      - nb_pw_cleared is defined
+      - nb_pw_cleared.json is defined
+      - (nb_pw_cleared.json.custom_fields.proxmox_node | default('')) | length == 0
