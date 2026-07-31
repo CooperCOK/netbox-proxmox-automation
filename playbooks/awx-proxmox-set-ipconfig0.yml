@@ -236,3 +236,39 @@
     until: _ujobs_alias_vc_0.finished
     retries: 60
     delay: 10
+
+  # ---------------------------------------------------------------------------
+  # Zustand in NetBox fortschreiben - Custom Field proxmox_status.
+  #
+  # Gleiches Muster wie MaaS_Status bei den Devices. "configure network" ist der
+  # Wert, der diesen Job ausloest; hier wird er auf den Endzustand gesetzt.
+  # Damit ist zugleich der Ausloeser wieder entschaerft - das Feld steht nicht
+  # dauerhaft auf "configure network", und ein spaeteres Speichern der VM
+  # startet den Job nicht erneut.
+  #
+  # Bewusst als letzter Schritt, nach dem Warten auf den Proxmox-Job: Steht der
+  # Wert, ist die Konfiguration wirklich angekommen.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the VM in NetBox"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/?name={{ vm_config['name'] | urlencode }}"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_vm_for_status
+    when: vm_config['name'] in collected_proxmox_vm
+
+  - name: "Mark the network as configured in NetBox"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/{{ (nb_vm_for_status.json.results | first).id }}/"
+      method: PATCH
+      body_format: json
+      body:
+        custom_fields:
+          proxmox_status: "Clone created - network configured"
+      headers: "{{ nb_auth_headers }}"
+      status_code: 200
+      validate_certs: false
+    when:
+      - nb_vm_for_status is defined
+      - nb_vm_for_status.json is defined
+      - (nb_vm_for_status.json.count | default(0) | int) > 0

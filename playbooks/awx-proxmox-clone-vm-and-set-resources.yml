@@ -389,3 +389,44 @@
       - nb_pw_cleared is defined
       - nb_pw_cleared.json is defined
       - (nb_pw_cleared.json.custom_fields.proxmox_node | default('')) | length == 0
+
+  # ---------------------------------------------------------------------------
+  # Zustand in NetBox fortschreiben - Custom Field proxmox_status.
+  #
+  # Gleiches Muster wie MaaS_Status bei den Devices: Das Feld bildet ab, wo die
+  # VM im Ablauf steht, und dient zugleich als Ausloeser fuer den naechsten
+  # Schritt. Reihenfolge:
+  #
+  #   (leer)                              -> VM in NetBox angelegt
+  #   "Clone created"                     <- dieser Job, nach erfolgreichem Klon
+  #   "configure network"                 <- von Hand gesetzt, loest die
+  #                                          Netzwerkkonfiguration aus
+  #   "Clone created - network configured" <- awx-proxmox-set-ipconfig0.yml
+  #
+  # Bewusst als letzter Schritt: Steht der Wert, ist alles davor durchgelaufen.
+  #
+  # Kein Kreislauf: Die Event Rule fuer die Netzwerkkonfiguration prueft auf
+  # "configure network"; dieser Schreibvorgang setzt einen anderen Wert und
+  # loest sie deshalb nicht aus.
+  #
+  # Der VM-Datensatz wurde weiter oben bereits fuer die Disk-Groesse gelesen
+  # (nb_requested_disk) - die id von dort wird hier wiederverwendet.
+  # ---------------------------------------------------------------------------
+  - name: "Mark the clone as created in NetBox"
+    ansible.builtin.uri:
+      url: >-
+        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-machines/{{ (nb_requested_disk.json.results | first).id }}/
+      method: PATCH
+      body_format: json
+      body:
+        custom_fields:
+          proxmox_status: "Clone created"
+      headers:
+        Authorization: "Token {{ netbox_env_info.api_token }}"
+        Accept: "application/json"
+      status_code: 200
+      validate_certs: false
+    when:
+      - nb_requested_disk is defined
+      - nb_requested_disk.json is defined
+      - (nb_requested_disk.json.count | default(0) | int) > 0
