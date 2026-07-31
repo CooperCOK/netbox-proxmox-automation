@@ -148,6 +148,98 @@
 #    debug:
 #      msg: "human readable disk size: {{ new_proxmox_vm.proxmox_vms[0].maxdisk | human_readable(unit='M') }} ||| {{ new_proxmox_vm.proxmox_vms[0].maxdisk | human_readable(unit='M') | regex_replace('\\s+[M][Bb]$', '') | int | string }} ||| {{ new_proxmox_vm.proxmox_vms[0].maxdisk | human_readable(unit='M') | regex_replace('\\s+[M][Bb]$', '') | int | string | type_debug }}"
 
+  # ---------------------------------------------------------------------------
+  # Die in NetBox gewuenschte Disk-Groesse einloesen.
+  #
+  # Der Clone-Job bekommt vom Webhook nur node, name, vmid, vcpus, memory,
+  # template und storage - die Disk-Groesse ist NICHT dabei. Die geklonte VM
+  # erbt damit zwangslaeufig die Disk des Templates.
+  #
+  # Ohne diesen Block schrieb der folgende Task die geerbte Groesse nach NetBox
+  # zurueck und ueberschrieb damit die Vorgabe des Anwenders. Beobachtet am
+  # 31.07.2026: VM mit 100000 MB angelegt, Template hat 80 GB -> NetBox stand
+  # danach auf 81920 MB. Dieser Rueckschreibvorgang loeste ausserdem die Event
+  # Rule fuer Resize aus, die dann 80G auf eine 80G-Disk anwendete - ein
+  # Kreislauf, der die Vorgabe verwarf und wie ein erfolgreicher Lauf aussah.
+  #
+  # Deshalb: Sollgroesse aus NetBox nachschlagen und die Disk VOR dem
+  # Rueckschreiben darauf vergroessern. Danach stimmen Soll und Ist ueberein
+  # und es feuert kein sinnloses Resize-Event mehr.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the disk size requested in NetBox"
+    ansible.builtin.uri:
+      url: >-
+        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-disks/?virtual_machine={{ new_proxmox_vm.proxmox_vms[0].name | urlencode }}&name=scsi0
+      headers:
+        Authorization: "Token {{ netbox_env_info.api_token }}"
+        Accept: "application/json"
+      validate_certs: false
+    register: nb_requested_disk
+    when: new_proxmox_vm is defined and new_proxmox_vm.proxmox_vms is defined and new_proxmox_vm.proxmox_vms | length > 0
+
+  - name: "Determine requested and cloned disk size"
+    ansible.builtin.set_fact:
+      # NetBox fuehrt VirtualDisk.size in MB, Proxmox meldet maxdisk in Bytes.
+      requested_disk_mb: "{{ (nb_requested_disk.json.results[0].size | default(0)) | int }}"
+      cloned_disk_mb: "{{ (new_proxmox_vm.proxmox_vms[0].maxdisk | int / 1048576) | round | int }}"
+    when: nb_requested_disk is defined and nb_requested_disk.json is defined
+
+  - name: "Fail if the requested disk is smaller than the template's"
+    ansible.builtin.fail:
+      msg: >-
+        In NetBox sind fuer scsi0 {{ requested_disk_mb }} MB hinterlegt, das
+        Template liefert aber {{ cloned_disk_mb }} MB. Verkleinern ist bei
+        Proxmox/Ceph RBD nicht moeglich. Die VM
+        '{{ vm_config['name'] }}' wurde bereits angelegt und behaelt die
+        Template-Groesse - bitte den Wert in NetBox auf mindestens
+        {{ cloned_disk_mb }} MB korrigieren oder ein passendes Template waehlen.
+    when:
+      - requested_disk_mb is defined
+      - requested_disk_mb | int > 0
+      - requested_disk_mb | int < cloned_disk_mb | int
+
+  - name: "Grow the cloned disk to the size requested in NetBox"
+    community.proxmox.proxmox_disk:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
+      api_user: "{{ proxmox_env_info.api_user }}"
+      api_token_id: "{{ proxmox_env_info.api_token_id }}"
+      api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
+      api_host: "{{ vm_config['node'] }}"
+      name: "{{ vm_config['name'] }}"
+      disk: scsi0
+      # Bewusst in MB statt in GB: die NetBox-Vorgabe ist nicht zwingend ein
+      # glattes Vielfaches von 1024 (z.B. 100000 MB). Ein Umrechnen auf ganze
+      # GB wuerde runden und Soll und Ist dauerhaft auseinanderlaufen lassen.
+      size: "{{ requested_disk_mb | int }}M"
+      state: resized
+    register: clone_disk_grown
+    when:
+      - requested_disk_mb is defined
+      - requested_disk_mb | int > cloned_disk_mb | int
+
+  # Nach dem Vergroessern den Ist-Stand neu einlesen: Proxmox rundet die
+  # RBD-Groesse gegebenenfalls auf, und nach NetBox gehoert der tatsaechliche
+  # Wert - nicht der angeforderte.
+  - name: "Re-read VM info after growing the disk"
+    community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
+      api_host: "{{ vm_config['node'] }}"
+      api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
+      api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"
+      api_token_secret: "{{ proxmox_env_info.api_token_secret | default(omit) }}"
+      node: "{{ vm_config['node'] }}"
+      name: "{{ vm_config['name'] }}"
+    register: proxmox_vm_after_grow
+    when: clone_disk_grown is defined and clone_disk_grown is changed
+
+  - name: "Determine the effective disk size for NetBox"
+    ansible.builtin.set_fact:
+      effective_disk_mb: >-
+        {{ ((proxmox_vm_after_grow.proxmox_vms[0].maxdisk
+             if (proxmox_vm_after_grow.proxmox_vms is defined and proxmox_vm_after_grow.proxmox_vms | length > 0)
+             else new_proxmox_vm.proxmox_vms[0].maxdisk) | int / 1048576) | round | int }}
+    when: new_proxmox_vm is defined and new_proxmox_vm.proxmox_vms is defined and new_proxmox_vm.proxmox_vms | length > 0
+
   - name: "Update Proxmox storage for VM in NetBox"
     netbox.netbox.netbox_virtual_disk:
       netbox_url: "{{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port}}"
@@ -155,7 +247,7 @@
       data:
         virtual_machine: "{{ new_proxmox_vm.proxmox_vms[0].name }}"
         name: scsi0
-        size: "{{ new_proxmox_vm.proxmox_vms[0].maxdisk | human_readable(unit='M') | regex_replace('\\s+[M][Bb]$', '') | int | string }}"
+        size: "{{ effective_disk_mb | int | string }}"
         custom_fields:
           proxmox_disk_storage_volume: "{{ vm_config['storage'] }}"
       state: present
