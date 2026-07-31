@@ -223,6 +223,23 @@
       ipconfig:
         ipconfig0: "{{ vm_ipconfig0 }}"
       update: true
+      # ZWINGEND, sonst wird net LAUTLOS verworfen.
+      #
+      # proxmox_kvm ueberspringt bei update=true die Parameter net, virtio,
+      # virtiofs, ide, sata und scsi, solange update_unsafe nicht gesetzt ist
+      # (proxmox_kvm.py: "If update, don't update disk ... and network
+      # interface, unless update_unsafe=True"). Der Task meldet trotzdem
+      # changed, weil ipconfig0 durchgeht - am 31.07.2026 genau so beobachtet:
+      # ipconfig0 stand danach auf ip=dhcp, net0 unveraendert auf vnet50.
+      #
+      # Die Begruendung des Moduls fuer die Sperre ist, dass ein Update von net
+      # die MAC-Adresse neu vergibt. Genau das kann hier nicht passieren: Der
+      # Task oben liest die bestehende net0-Zeile und ersetzt ausschliesslich
+      # die Bridge - Modell, MAC und Flags werden unveraendert mitgeschrieben.
+      #
+      # Disk-Parameter sind von der Lockerung nicht betroffen, weil dieser Task
+      # keine uebergibt.
+      update_unsafe: true
     when: vm_config['name'] in collected_proxmox_vm
     register: update_vm_settings_job
     async: 180
