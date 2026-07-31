@@ -166,10 +166,21 @@
   # Rueckschreiben darauf vergroessern. Danach stimmen Soll und Ist ueberein
   # und es feuert kein sinnloses Resize-Event mehr.
   # ---------------------------------------------------------------------------
+  # Die Vorgabe steht im Feld "disk" der VIRTUAL MACHINE, nicht in einem
+  # VirtualDisk-Objekt: Beim Anlegen einer VM in NetBox wird dort die
+  # gewuenschte Groesse in MB eingetragen. Ein VirtualDisk gibt es zu diesem
+  # Zeitpunkt noch nicht - das legt erst der Task "Update Proxmox storage for
+  # VM in NetBox" weiter unten an. Sobald es existiert, berechnet NetBox
+  # VirtualMachine.disk aus der Summe der VirtualDisks; ein erneuter Lauf liest
+  # hier also den Ist-Wert und vergroessert nichts mehr. Das ist gewollt.
+  #
+  # Am 31.07.2026 im NetBox-Aenderungsprotokoll belegt:
+  #   19:01:13 create testclone111 user=rz4adm.gt disk: None  -> 102390
+  #   19:01:52 update testclone111 user=Ansible   disk: 81920 -> 81920
   - name: "Look up the disk size requested in NetBox"
     ansible.builtin.uri:
       url: >-
-        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-disks/?virtual_machine={{ new_proxmox_vm.proxmox_vms[0].name | urlencode }}&name=scsi0
+        {{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}/api/virtualization/virtual-machines/?name={{ new_proxmox_vm.proxmox_vms[0].name | urlencode }}
       headers:
         Authorization: "Token {{ netbox_env_info.api_token }}"
         Accept: "application/json"
@@ -179,16 +190,16 @@
 
   - name: "Determine requested and cloned disk size"
     ansible.builtin.set_fact:
-      # NetBox fuehrt VirtualDisk.size in MB, Proxmox meldet maxdisk in Bytes.
-      requested_disk_mb: "{{ (nb_requested_disk.json.results[0].size | default(0)) | int }}"
+      # NetBox fuehrt die Groesse in MB, Proxmox meldet maxdisk in Bytes.
+      requested_disk_mb: "{{ (nb_requested_disk.json.results[0].disk | default(0) | default(0, true)) | int }}"
       cloned_disk_mb: "{{ (new_proxmox_vm.proxmox_vms[0].maxdisk | int / 1048576) | round | int }}"
     when: nb_requested_disk is defined and nb_requested_disk.json is defined
 
   - name: "Fail if the requested disk is smaller than the template's"
     ansible.builtin.fail:
       msg: >-
-        In NetBox sind fuer scsi0 {{ requested_disk_mb }} MB hinterlegt, das
-        Template liefert aber {{ cloned_disk_mb }} MB. Verkleinern ist bei
+        In NetBox sind fuer die VM {{ requested_disk_mb }} MB Disk hinterlegt,
+        das Template liefert aber {{ cloned_disk_mb }} MB. Verkleinern ist bei
         Proxmox/Ceph RBD nicht moeglich. Die VM
         '{{ vm_config['name'] }}' wurde bereits angelegt und behaelt die
         Template-Groesse - bitte den Wert in NetBox auf mindestens
