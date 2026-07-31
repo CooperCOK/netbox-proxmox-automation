@@ -24,7 +24,11 @@
       api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
       api_host: "{{ proxmox_env_info.api_host }}"
       name: "{{ vm_config['name'] }}"
-      node: "{{ vm_config['node'] }}"
+      # KEIN node: - community.proxmox.proxmox_disk kennt diesen Parameter
+      # nicht und bricht damit ab ("Unsupported parameters ... module: node").
+      # Upstream steht er trotzdem drin (netboxlabs, 303217db). Das Modul
+      # findet die VM ueber name/vmid am api_host; auf Standalone-Hosts ist
+      # api_host ohnehin genau der Node, auf dem die VM liegt.
       disk: "{{ vm_config['remove_disk'] }}"
       state: absent
     when: vm_config['name'] in collected_proxmox_vm
