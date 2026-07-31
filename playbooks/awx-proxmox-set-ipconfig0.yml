@@ -9,6 +9,17 @@
     proxmox_node_info: {}
     collected_proxmox_vms: []
 
+    # Fuer SDN- und Config-Abfragen gibt es kein passendes Modul, die laufen
+    # deshalb direkt gegen die Proxmox-API. Die Tasks, die diesen Header
+    # verwenden, sind mit no_log versehen - sonst stuende das Token im AWX-Log.
+    pve_api_base: "https://{{ proxmox_env_info.api_host }}:{{ proxmox_env_info.api_port | default(8006) }}/api2/json"
+    pve_auth_headers:
+      Authorization: "PVEAPIToken={{ proxmox_env_info.api_user }}!{{ proxmox_env_info.api_token_id }}={{ proxmox_env_info.api_token_secret }}"
+    nb_api_base: "{{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}"
+    nb_auth_headers:
+      Authorization: "Token {{ netbox_env_info.api_token }}"
+      Accept: "application/json"
+
   tasks:
   - name: Include Proxmox VM discovery
     include_tasks: "ansible-tasks/collect-proxmox-vm.yml"
@@ -16,21 +27,201 @@
   - name: Include Proxmox LXC discovery
     include_tasks: "ansible-tasks/collect-proxmox-lxc.yml"
 
-  - name: "Update VM settings (ipconfig0, ssh key)"
+  # ---------------------------------------------------------------------------
+  # Die Werte kommen als gerenderte Webhook-Strings an. Ein leeres NetBox-Feld
+  # wird dabei zum Text "None", nicht zu einem leeren Wert - ungeprueft landete
+  # dieser Text bisher als SSH-Key in der VM.
+  # ---------------------------------------------------------------------------
+  - name: "Normalise the values coming from the webhook"
+    ansible.builtin.set_fact:
+      vm_ip_cidr: "{{ '' if ((vm_config['ip'] | default('') | string) in ['', 'None', 'none', 'null']) else (vm_config['ip'] | string) }}"
+      vm_ssh_key: "{{ '' if ((vm_config['ssh_key'] | default('') | string) in ['', 'None', 'none', 'null']) else (vm_config['ssh_key'] | string) }}"
+
+  # ---------------------------------------------------------------------------
+  # 1) VLAN bestimmen
+  #
+  # Primaerquelle ist das VLAN am NetBox-Interface der VM - egal ob als
+  # untagged (mode=access) oder als erstes tagged VLAN hinterlegt. Beide
+  # Schreibweisen kommen im Bestand vor.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the VM interface in NetBox"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/virtualization/interfaces/?virtual_machine={{ vm_config['name'] | urlencode }}"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_vm_interfaces
+
+  - name: "Determine the VLAN from the NetBox interface"
+    vars:
+      iface: "{{ (nb_vm_interfaces.json.results | default([]) | first) | default({}) }}"
+    ansible.builtin.set_fact:
+      interface_vlan_vid: >-
+        {{ ((iface.untagged_vlan | default(None)).vid
+            if ((iface.untagged_vlan | default(None)) is mapping)
+            else ((iface.tagged_vlans | default([]) | first).vid
+                  if ((iface.tagged_vlans | default([]) | length) > 0)
+                  else 0)) | int }}
+    when: (nb_vm_interfaces.json.count | default(0) | int) > 0
+
+  # ---------------------------------------------------------------------------
+  # 2) Prefix der IP suchen - liefert das Gateway und, falls am Interface kein
+  #    VLAN gesetzt ist, einen Rueckfall fuer das VLAN. Prefixe tragen in
+  #    NetBox eine VLAN-Zuordnung (z.B. 10.251.0.0/24 -> VLAN 50).
+  # ---------------------------------------------------------------------------
+  - name: "Look up the prefix containing the VM IP"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/ipam/prefixes/?contains={{ (vm_ip_cidr | regex_replace('/.*$', '')) | urlencode }}"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_prefixes
+    when: vm_ip_cidr | length > 0
+
+  - name: "Pick the most specific prefix"
+    ansible.builtin.set_fact:
+      # _depth steigt mit der Verschachtelungstiefe - der letzte Eintrag ist
+      # damit das spezifischste Prefix.
+      vm_prefix_obj: "{{ (nb_prefixes.json.results | sort(attribute='_depth') | last) }}"
+    when:
+      - nb_prefixes is defined
+      - (nb_prefixes.json.count | default(0) | int) > 0
+
+  - name: "Determine the effective VLAN"
+    ansible.builtin.set_fact:
+      # vm_prefix_obj existiert nur, wenn eine IP gesetzt ist - daher der
+      # default({}), sonst haengt der Rueckfall an einer undefinierten Variable.
+      effective_vlan_vid: >-
+        {{ (interface_vlan_vid | default(0) | int)
+           if ((interface_vlan_vid | default(0) | int) > 0)
+           else ((vm_prefix_obj | default({})).vlan.vid | default(0) | int) }}
+
+  # ---------------------------------------------------------------------------
+  # 3) VNet zum VLAN-Tag ermitteln.
+  #
+  # Bewusst per Nachschlagen statt "vnet" ~ vlan_id: Die Namensgebung ist eine
+  # Konvention, kein Zwang. Massgeblich ist das Tag der SDN-VNets - so bleibt
+  # es richtig, falls ein VNet einmal anders heisst.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the Proxmox SDN vnets"
+    ansible.builtin.uri:
+      url: "{{ pve_api_base }}/cluster/sdn/vnets"
+      headers: "{{ pve_auth_headers }}"
+      validate_certs: false
+    register: pve_sdn_vnets
+    no_log: true
+    when: (effective_vlan_vid | default(0) | int) > 0
+
+  - name: "Determine the vnet carrying that VLAN tag"
+    ansible.builtin.set_fact:
+      vm_vnet: >-
+        {{ (pve_sdn_vnets.json.data | default([])
+            | selectattr('tag', 'defined')
+            | selectattr('tag', 'equalto', effective_vlan_vid | int)
+            | map(attribute='vnet') | list | first) | default('') }}
+    when:
+      - pve_sdn_vnets is defined
+      - pve_sdn_vnets.json is defined
+
+  - name: "Fail if the VLAN has no matching vnet"
+    ansible.builtin.fail:
+      msg: >-
+        Fuer VLAN {{ effective_vlan_vid }} gibt es auf {{ vm_config['node'] }}
+        kein SDN-VNet. Vorhanden sind:
+        {{ pve_sdn_vnets.json.data | default([]) | map(attribute='vnet') | join(', ') }}.
+        Entweder das VLAN am Interface in NetBox korrigieren oder das VNet in
+        Proxmox anlegen.
+    when:
+      - (effective_vlan_vid | default(0) | int) > 0
+      - (vm_vnet | default('')) | length == 0
+
+  # ---------------------------------------------------------------------------
+  # 4) net0 neu bauen.
+  #
+  # NICHT einfach "virtio,bridge=X" setzen: Damit wuerde Proxmox eine neue MAC
+  # vergeben, und Windows saehe eine fremde Netzwerkkarte - inklusive neuem
+  # Netzwerkprofil und verlorener Adapterkonfiguration. Deshalb wird die
+  # bestehende Zeile gelesen und ausschliesslich die Bridge ersetzt; Modell,
+  # MAC und Flags wie firewall=1 bleiben unangetastet.
+  # ---------------------------------------------------------------------------
+  - name: "Read the current VM config from Proxmox"
+    ansible.builtin.uri:
+      url: "{{ pve_api_base }}/nodes/{{ vm_config['node'] }}/qemu/{{ collected_proxmox_vm[vm_config['name']] }}/config"
+      headers: "{{ pve_auth_headers }}"
+      validate_certs: false
+    register: pve_vm_cfg
+    no_log: true
+    when:
+      - vm_config['name'] in collected_proxmox_vm
+      - (vm_vnet | default('')) | length > 0
+
+  - name: "Rebuild net0 with the new bridge, keeping model, MAC and flags"
+    ansible.builtin.set_fact:
+      vm_net0: "{{ pve_vm_cfg.json.data.net0 | regex_replace('bridge=[^,]+', 'bridge=' ~ vm_vnet) }}"
+    when:
+      - pve_vm_cfg is defined
+      - pve_vm_cfg.json is defined
+      - (pve_vm_cfg.json.data.net0 | default('')) | length > 0
+
+  # ---------------------------------------------------------------------------
+  # 5) Gateway aus dem Prefix holen.
+  #
+  # Konvention: Die Gateway-Adresse traegt "default_gateway" in ihrer
+  # Beschreibung. Findet sich keine, wird ipconfig0 ohne gw= gesetzt - die VM
+  # ist dann im eigenen Subnetz erreichbar, aber nicht darueber hinaus.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the default gateway inside that prefix"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/ipam/ip-addresses/?parent={{ vm_prefix_obj.prefix | urlencode }}&description__ic=default_gateway"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_gateway
+    when: vm_prefix_obj is defined
+
+  - name: "Determine the gateway address"
+    ansible.builtin.set_fact:
+      vm_gateway: >-
+        {{ ((nb_gateway.json.results | default([]) | map(attribute='address') | list | first) | default(''))
+           | regex_replace('/.*$', '') }}
+    when:
+      - nb_gateway is defined
+      - nb_gateway.json is defined
+
+  # ---------------------------------------------------------------------------
+  # 6) ipconfig0 zusammensetzen.
+  #      keine IP        -> DHCP
+  #      IP ohne Gateway -> nur ip=
+  #      IP mit Gateway  -> ip= und gw=
+  # ---------------------------------------------------------------------------
+  - name: "Assemble ipconfig0"
+    ansible.builtin.set_fact:
+      vm_ipconfig0: >-
+        {{ 'ip=dhcp' if ((vm_ip_cidr | length) == 0)
+           else ('ip=' ~ vm_ip_cidr ~ ',gw=' ~ vm_gateway
+                 if ((vm_gateway | default('') | length) > 0)
+                 else 'ip=' ~ vm_ip_cidr) }}
+
+  - name: "Show what will be applied"
+    ansible.builtin.debug:
+      msg:
+        - "VLAN      : {{ effective_vlan_vid | default(0) }} (Interface: {{ interface_vlan_vid | default(0) }}, Prefix: {{ (vm_prefix_obj | default({})).vlan.vid | default('-') }})"
+        - "VNet      : {{ vm_vnet | default('(unveraendert)') }}"
+        - "net0      : {{ vm_net0 | default('(unveraendert)') }}"
+        - "Prefix    : {{ (vm_prefix_obj | default({})).prefix | default('-') }}"
+        - "Gateway   : {{ vm_gateway | default('(keines gefunden)') }}"
+        - "ipconfig0 : {{ vm_ipconfig0 }}"
+
+  - name: "Update VM settings (network, ipconfig0, ssh key)"
     community.proxmox.proxmox_kvm:
       validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
-      #node: "{{ proxmox_env_info.node }}"
       node: "{{ vm_config['node'] }}"
       api_user: "{{ proxmox_env_info.api_user }}"
       api_token_id: "{{ proxmox_env_info.api_token_id }}"
       api_token_secret: "{{ proxmox_env_info.api_token_secret }}"
       api_host: "{{ proxmox_env_info.api_host }}"
-      #name: "{{ vm_config['name'] }}"
       vmid: "{{ collected_proxmox_vm[vm_config['name']] }}"
-      sshkeys: "{{ vm_config['ssh_key'] }}"
+      sshkeys: "{{ vm_ssh_key if ((vm_ssh_key | length) > 0) else omit }}"
+      net: "{{ {'net0': vm_net0} if ((vm_net0 | default('') | length) > 0) else omit }}"
       ipconfig:
-        #ipconfig0: "ip={{ item.ip }},gw={{ item.ip.split('.')[:3] | join('.') }}.{{ item.gw if item.gw is defined else gw_last_quad }}"
-        ipconfig0: "ip={{ vm_config['ip'] }},gw={{ vm_config['ip'].split('.')[:3] | join('.') }}.1"
+        ipconfig0: "{{ vm_ipconfig0 }}"
       update: true
     when: vm_config['name'] in collected_proxmox_vm
     register: update_vm_settings_job
@@ -45,4 +236,3 @@
     until: _ujobs_alias_vc_0.finished
     retries: 60
     delay: 10
-

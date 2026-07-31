@@ -9,6 +9,14 @@
     proxmox_node_info: {}
     collected_proxmox_vms: []
 
+    # Name, unter dem das Netzwerkinterface in NetBox angelegt wird. Er soll
+    # dem entsprechen, was der Gast selbst anzeigt - sonst laesst sich in
+    # NetBox nicht nachvollziehen, welches Interface gemeint ist.
+    # Windows benennt die erste Karte "Ethernet", Debian/Ubuntu vergeben auf
+    # Proxmox-VMs mit virtio ueblicherweise "ens18".
+    windows_interface_name: "Ethernet"
+    default_interface_name: "ens18"
+
   tasks:
   - name: Include Proxmox VM discovery
     include_tasks: "ansible-tasks/collect-proxmox-vm.yml"
@@ -263,6 +271,69 @@
           proxmox_disk_storage_volume: "{{ vm_config['storage'] }}"
       state: present
     when: new_proxmox_vm is defined and new_proxmox_vm.proxmox_vms is defined and new_proxmox_vm.proxmox_vms | length > 0
+
+  # ---------------------------------------------------------------------------
+  # Netzwerkinterface in NetBox anlegen.
+  #
+  # Das Template bringt eine Netzwerkkarte ohne inhaltliche Konfiguration mit
+  # (kein ipconfig0, im Gast auf DHCP). Damit in NetBox ueberhaupt ein Objekt
+  # existiert, an das sich VLAN und IP haengen lassen, legt dieser Job das
+  # Interface an - bewusst NUR anlegen, ohne VLAN und ohne IP. Die eigentliche
+  # Konfiguration kommt danach aus awx-proxmox-set-ipconfig0.yml, das aus dem
+  # dort gesetzten VLAN das passende Proxmox-VNet ermittelt.
+  #
+  # Der Name soll dem entsprechen, was der Gast selbst anzeigt - sonst laesst
+  # sich in NetBox nicht zuordnen, welches Interface gemeint ist. Ob Windows
+  # vorliegt, verraet der Name des Templates: vm_config['template'] enthaelt
+  # dessen VMID (z.B. "9000"), der Name wird dazu aus Proxmox gelesen.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the template name to detect the guest OS"
+    community.proxmox.proxmox_vm_info:
+      validate_certs: "{{ proxmox_env_info.validate_certs | default(false) }}"
+      api_host: "{{ vm_config['node'] }}"
+      api_user: "{{ proxmox_env_info.api_user | default(omit) }}"
+      api_token_id: "{{ proxmox_env_info.api_token_id | default(omit) }}"
+      api_token_secret: "{{ proxmox_env_info.api_token_secret | default(omit) }}"
+      node: "{{ vm_config['node'] }}"
+      vmid: "{{ vm_config['template'] | int }}"
+    register: clone_template_info
+    # Scheitert der Lookup, soll das nicht den gesamten Klon-Job kippen - die
+    # VM ist zu diesem Zeitpunkt bereits angelegt. Das Interface wird dann
+    # schlicht nicht erzeugt und laesst sich von Hand nachtragen.
+    failed_when: false
+    when: new_proxmox_vm is defined and new_proxmox_vm.proxmox_vms is defined and new_proxmox_vm.proxmox_vms | length > 0
+
+  - name: "Determine the interface name from the template's OS"
+    ansible.builtin.set_fact:
+      guest_interface_name: >-
+        {{ windows_interface_name
+           if ((clone_template_info.proxmox_vms | default([]) | map(attribute='name') | join(' ') | lower) is search('windows'))
+           else default_interface_name }}
+    when:
+      - clone_template_info is defined
+      - clone_template_info.proxmox_vms is defined
+      - clone_template_info.proxmox_vms | length > 0
+
+  - name: "Show which interface will be created"
+    ansible.builtin.debug:
+      msg: >-
+        Template {{ vm_config['template'] }} =
+        '{{ clone_template_info.proxmox_vms | default([]) | map(attribute='name') | join(', ') }}'
+        -> Interface '{{ guest_interface_name }}' in NetBox
+    when: guest_interface_name is defined
+
+  - name: "Create the VM network interface in NetBox"
+    netbox.netbox.netbox_vm_interface:
+      netbox_url: "{{ netbox_env_info.api_proto }}://{{ netbox_env_info.api_host }}:{{ netbox_env_info.api_port }}"
+      netbox_token: "{{ netbox_env_info.api_token }}"
+      data:
+        virtual_machine: "{{ new_proxmox_vm.proxmox_vms[0].name }}"
+        name: "{{ guest_interface_name }}"
+        enabled: true
+      state: present
+    when:
+      - guest_interface_name is defined
+      - guest_interface_name | length > 0
 
   # ---------------------------------------------------------------------------
   # Erst-Passwort in NetBox wieder leeren.
