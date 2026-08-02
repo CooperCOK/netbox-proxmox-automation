@@ -64,6 +64,39 @@
     when: (nb_vm_interfaces.json.count | default(0) | int) > 0
 
   # ---------------------------------------------------------------------------
+  # 1b) Rueckfall auf die IP am Interface.
+  #
+  # Der Webhook liefert data['primary_ip4']['address'] - das ist ein EIGENES
+  # Feld an der VM und wird NICHT gesetzt, nur weil man einem Interface eine
+  # IP zuweist. Genau daran ist es am 31.07.2026 gescheitert: tsplus01 hatte
+  # 10.251.0.30/24 am Interface Ethernet haengen, primary_ip4 war leer, und der
+  # Job konfigurierte daraufhin DHCP.
+  #
+  # Die IP am Interface ist die Stelle, an der man sie fachlich erwartet.
+  # Deshalb wird sie hier herangezogen, wenn primary_ip4 leer ist. Ist
+  # primary_ip4 gesetzt, hat es Vorrang - das ist die ausdrueckliche Ansage,
+  # welche der moeglicherweise mehreren Adressen gelten soll.
+  # ---------------------------------------------------------------------------
+  - name: "Look up IPv4 addresses assigned to the VM interface"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/ipam/ip-addresses/?vminterface_id={{ (nb_vm_interfaces.json.results | first).id }}&family=4"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_iface_ips
+    when:
+      - (nb_vm_interfaces.json.count | default(0) | int) > 0
+      - (vm_ip_cidr | length) == 0
+
+  - name: "Fall back to the interface IP when the VM has no primary IPv4"
+    ansible.builtin.set_fact:
+      vm_ip_cidr: "{{ (nb_iface_ips.json.results | default([]) | map(attribute='address') | list | first) | default('') }}"
+      vm_ip_source: "Interface (primary_ip4 der VM ist leer)"
+    when:
+      - nb_iface_ips is defined
+      - nb_iface_ips.json is defined
+      - (nb_iface_ips.json.count | default(0) | int) > 0
+
+  # ---------------------------------------------------------------------------
   # 2) Prefix der IP suchen - liefert das Gateway und, falls am Interface kein
   #    VLAN gesetzt ist, einen Rueckfall fuer das VLAN. Prefixe tragen in
   #    NetBox eine VLAN-Zuordnung (z.B. 10.251.0.0/24 -> VLAN 50).
@@ -203,6 +236,7 @@
     ansible.builtin.debug:
       msg:
         - "VLAN      : {{ effective_vlan_vid | default(0) }} (Interface: {{ interface_vlan_vid | default(0) }}, Prefix: {{ (vm_prefix_obj | default({})).vlan.vid | default('-') }})"
+        - "IP-Quelle : {{ vm_ip_source | default('primary_ip4 der VM') }}"
         - "VNet      : {{ vm_vnet | default('(unveraendert)') }}"
         - "net0      : {{ vm_net0 | default('(unveraendert)') }}"
         - "Prefix    : {{ (vm_prefix_obj | default({})).prefix | default('-') }}"
