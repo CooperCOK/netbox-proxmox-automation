@@ -38,6 +38,40 @@
       vm_ssh_key: "{{ '' if ((vm_config['ssh_key'] | default('') | string) in ['', 'None', 'none', 'null']) else (vm_config['ssh_key'] | string) }}"
 
   # ---------------------------------------------------------------------------
+  # 0) VM-Datensatz holen - liefert die DNS-Server und weiter unten die id fuer
+  #    das Fortschreiben von proxmox_status.
+  # ---------------------------------------------------------------------------
+  - name: "Look up the VM in NetBox"
+    ansible.builtin.uri:
+      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/?name={{ vm_config['name'] | urlencode }}"
+      headers: "{{ nb_auth_headers }}"
+      validate_certs: false
+    register: nb_vm
+
+  # ---------------------------------------------------------------------------
+  # DNS-Server aus dem Custom Field proxmox_dns_servers.
+  #
+  # Ist das Feld leer, wird nameservers NICHT uebergeben und Proxmox verhaelt
+  # sich wie ohne diese Automatisierung.
+  #
+  # ACHTUNG, was "Standardverhalten" konkret bedeutet (Cloudinit.pm,
+  # get_dns_conf): Ohne gesetzten nameserver nimmt Proxmox die /etc/resolv.conf
+  # des HYPERVISORS. Auf STR1-0005-AH01 steht dort "nameserver 127.0.0.53" -
+  # der systemd-resolved-Stub. Eine VM mit STATISCHER IP bekommt dann diese
+  # Loopback-Adresse als DNS-Server eingetragen und loest nichts auf. Bei
+  # ip=dhcp ist es unkritisch, dort liefert der DHCP-Server das DNS und
+  # Proxmox schreibt gar keine DNS-Zeile.
+  #
+  # Getrennt wird an Leerzeichen, Komma oder Semikolon - je nachdem, wie es
+  # jemand eintraegt.
+  # ---------------------------------------------------------------------------
+  - name: "Determine the DNS servers from NetBox"
+    vars:
+      dns_raw: "{{ (((nb_vm.json.results | default([]) | first | default({})).custom_fields | default({})).proxmox_dns_servers | default('') | string) }}"
+    ansible.builtin.set_fact:
+      vm_dns_servers: "{{ [] if (dns_raw | trim | length) == 0 or (dns_raw | trim) in ['None', 'none', 'null'] else (dns_raw | regex_replace('[,;]', ' ')).split() }}"
+
+  # ---------------------------------------------------------------------------
   # 1) VLAN bestimmen
   #
   # Primaerquelle ist das VLAN am NetBox-Interface der VM - egal ob als
@@ -241,6 +275,7 @@
         - "net0      : {{ vm_net0 | default('(unveraendert)') }}"
         - "Prefix    : {{ (vm_prefix_obj | default({})).prefix | default('-') }}"
         - "Gateway   : {{ vm_gateway | default('(keines gefunden)') }}"
+        - "DNS       : {{ (vm_dns_servers | default([]) | join(', ')) if ((vm_dns_servers | default([]) | length) > 0) else '(nicht gesetzt - Proxmox-Standard, siehe Kommentar im Playbook)' }}"
         - "ipconfig0 : {{ vm_ipconfig0 }}"
 
   - name: "Update VM settings (network, ipconfig0, ssh key)"
@@ -254,6 +289,8 @@
       vmid: "{{ collected_proxmox_vm[vm_config['name']] }}"
       sshkeys: "{{ vm_ssh_key if ((vm_ssh_key | length) > 0) else omit }}"
       net: "{{ {'net0': vm_net0} if ((vm_net0 | default('') | length) > 0) else omit }}"
+      # Leer -> Parameter entfaellt -> Proxmox-Standardverhalten.
+      nameservers: "{{ vm_dns_servers if ((vm_dns_servers | default([]) | length) > 0) else omit }}"
       ipconfig:
         ipconfig0: "{{ vm_ipconfig0 }}"
       update: true
@@ -300,17 +337,10 @@
   # Bewusst als letzter Schritt, nach dem Warten auf den Proxmox-Job: Steht der
   # Wert, ist die Konfiguration wirklich angekommen.
   # ---------------------------------------------------------------------------
-  - name: "Look up the VM in NetBox"
-    ansible.builtin.uri:
-      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/?name={{ vm_config['name'] | urlencode }}"
-      headers: "{{ nb_auth_headers }}"
-      validate_certs: false
-    register: nb_vm_for_status
-    when: vm_config['name'] in collected_proxmox_vm
-
+  # Der VM-Datensatz wurde ganz oben schon geholt (nb_vm) - keine zweite Abfrage.
   - name: "Mark the network as configured in NetBox"
     ansible.builtin.uri:
-      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/{{ (nb_vm_for_status.json.results | first).id }}/"
+      url: "{{ nb_api_base }}/api/virtualization/virtual-machines/{{ (nb_vm.json.results | first).id }}/"
       method: PATCH
       body_format: json
       body:
@@ -320,6 +350,7 @@
       status_code: 200
       validate_certs: false
     when:
-      - nb_vm_for_status is defined
-      - nb_vm_for_status.json is defined
-      - (nb_vm_for_status.json.count | default(0) | int) > 0
+      - vm_config['name'] in collected_proxmox_vm
+      - nb_vm is defined
+      - nb_vm.json is defined
+      - (nb_vm.json.count | default(0) | int) > 0
