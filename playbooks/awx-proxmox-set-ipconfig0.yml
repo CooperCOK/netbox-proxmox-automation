@@ -20,6 +20,13 @@
       Authorization: "Token {{ netbox_env_info.api_token }}"
       Accept: "application/json"
 
+    # Nur fuer LAUFENDE VMs relevant. Das Neuerzeugen des Cloud-Init-Laufwerks
+    # aendert die Instanz-ID und laesst cloudbase-init beim naechsten Start
+    # ALLE Plugins erneut ausfuehren - inklusive SetUserPasswordPlugin. Ein
+    # zwischenzeitlich vergebenes Admin-Passwort faellt damit auf den
+    # cipassword-Wert zurueck. Deshalb aus; bewusst zu setzen, wenn gewollt.
+    regenerate_cloudinit_on_running_vm: false
+
   tasks:
   - name: Include Proxmox VM discovery
     include_tasks: "ansible-tasks/collect-proxmox-vm.yml"
@@ -326,31 +333,80 @@
     delay: 10
 
   # ---------------------------------------------------------------------------
-  # Cloud-Init-Laufwerk neu erzeugen.
+  # Cloud-Init-Laufwerk: ob es neu erzeugt werden muss, haengt am VM-Zustand.
   #
-  # ZWINGEND, sonst wirkt das oben gesetzte ipconfig0 bei einer bereits
-  # laufenden VM NICHT. Proxmox schreibt geaenderte Cloud-Init-Werte nur in die
-  # VM-Konfiguration; auf das Laufwerk gelangen sie erst beim naechsten
-  # Stop/Start oder durch diesen Aufruf. Bis dahin fuehrt "qm cloudinit pending"
-  # sie als "new" und der Gast liest weiter die alten Daten.
+  # GESTOPPTE VM (der Normalfall nach dem Klonen)
+  #   "qm set --ipconfig0" schreibt direkt in die Konfiguration, es entsteht
+  #   kein Eintrag in der Cloud-Init-Warteschlange, und Proxmox erzeugt das
+  #   Laufwerk beim naechsten Start selbst. Hier ist NICHTS zu tun.
   #
-  # Bei einer frisch geklonten VM faellt das nicht auf, weil sie ohnehin erst
-  # danach zum ersten Mal startet. Am 08.08.2026 an MGMTADC03 beobachtet:
-  # ipconfig0 in der Config gesetzt, Gast auf APIPA (169.254.x), und
-  # cloudbase-init meldete "NetworkConfigPlugin execution already done,
-  # skipping" - weil die Instanz-ID unveraendert blieb.
+  # LAUFENDE VM
+  #   Die Aenderung landet als "new" in der Warteschlange, der Gast liest
+  #   weiter die alten Daten. Am 08.08.2026 an MGMTADC03 beobachtet: ipconfig0
+  #   gesetzt, Gast auf APIPA (169.254.x), cloudbase-init meldete
+  #   "NetworkConfigPlugin execution already done, skipping".
   #
-  # Proxmox leitet die Instanz-ID aus dem INHALT der Cloud-Init-Daten ab
-  # (Cloudinit.pm: cloudbase_gen_instance_id). Nach dem Neuerzeugen ist sie
-  # anders, und cloudbase-init fuehrt beim naechsten Start alle Plugins erneut
-  # aus - das Netzwerk wird also tatsaechlich angewendet.
+  #   Wirksam wird es erst durch Neuerzeugen des Laufwerks PLUS Neustart. Und
+  #   das hat einen Preis: Proxmox leitet die Instanz-ID aus dem INHALT der
+  #   Cloud-Init-Daten ab (Cloudinit.pm: cloudbase_gen_instance_id). Mit einer
+  #   neuen ID sind fuer cloudbase-init ALLE Plugins wieder offen - nicht nur
+  #   NetworkConfigPlugin, sondern auch CreateUserPlugin und
+  #   SetUserPasswordPlugin. Ein zwischenzeitlich vergebenes Admin-Passwort
+  #   wird damit auf den cloud-init-Wert ZURUECKGESETZT. Ebenfalls am
+  #   08.08.2026 beobachtet, nachdem dieser Schritt zuvor bedingungslos lief.
   #
-  # NICHT enthalten: ein Neustart. cloudbase-init liest das Laufwerk nur beim
-  # Hochfahren, die neue Konfiguration greift also erst dann. Einen laufenden
-  # Server ungefragt neu zu starten waere hier aber der falsche Automatismus -
-  # das gehoert in die Hand dessen, der die Aenderung veranlasst.
+  #   Deshalb standardmaessig aus. Wer es braucht, setzt
+  #   regenerate_cloudinit_on_running_vm=true und weiss, was er tut.
   # ---------------------------------------------------------------------------
-  - name: "Regenerate the cloud-init drive so the guest actually sees the change"
+  - name: "Check whether the VM is running"
+    ansible.builtin.uri:
+      url: "{{ pve_api_base }}/nodes/{{ vm_config['node'] }}/qemu/{{ collected_proxmox_vm[vm_config['name']] }}/status/current"
+      headers: "{{ pve_auth_headers }}"
+      validate_certs: false
+    register: pve_vm_status
+    no_log: true
+    when: vm_config['name'] in collected_proxmox_vm
+
+  - name: "Determine the VM state"
+    ansible.builtin.set_fact:
+      vm_is_running: "{{ ((pve_vm_status.json.data.status | default('unknown')) == 'running') }}"
+    when:
+      - pve_vm_status is defined
+      - pve_vm_status.json is defined
+
+  - name: "Stopped VM - Proxmox applies the change at the next start"
+    ansible.builtin.debug:
+      msg: >-
+        '{{ vm_config['name'] }}' ist gestoppt. Proxmox erzeugt das
+        Cloud-Init-Laufwerk beim naechsten Start selbst, die Netzwerkkonfiguration
+        greift dann automatisch. Nichts weiter zu tun.
+    when: not (vm_is_running | default(false) | bool)
+
+  - name: "Fail if a running VM would need the disruptive regeneration"
+    ansible.builtin.fail:
+      msg: >-
+        '{{ vm_config['name'] }}' LAEUFT. Die neue Netzwerkkonfiguration steht
+        in der VM-Konfiguration, ist aber noch nicht wirksam - der Gast liest
+        weiter das alte Cloud-Init-Laufwerk.
+
+        Wirksam wird sie nur durch Neuerzeugen des Laufwerks und einen
+        Neustart. Dabei setzt cloudbase-init ALLE Plugins erneut aus, weil sich
+        die Instanz-ID aendert - das lokale Admin-Passwort faellt damit auf den
+        Wert aus cipassword zurueck.
+
+        Bewusst entscheiden, dann eine der beiden Varianten:
+          a) Job mit -e regenerate_cloudinit_on_running_vm=true erneut starten
+             und die VM anschliessend neu starten
+          b) von Hand: qm cloudinit update {{ collected_proxmox_vm[vm_config['name']] }}
+             danach VM neu starten
+
+        Solange nichts davon geschieht, bleibt die alte Netzwerkkonfiguration
+        aktiv - deshalb scheitert dieser Job, statt Erfolg zu melden.
+    when:
+      - vm_is_running | default(false) | bool
+      - not (regenerate_cloudinit_on_running_vm | default(false) | bool)
+
+  - name: "Regenerate the cloud-init drive (running VM, explicitly requested)"
     ansible.builtin.uri:
       url: "{{ pve_api_base }}/nodes/{{ vm_config['node'] }}/qemu/{{ collected_proxmox_vm[vm_config['name']] }}/cloudinit"
       method: PUT
@@ -358,15 +414,20 @@
       status_code: [200, 204]
       validate_certs: false
     no_log: true
-    when: vm_config['name'] in collected_proxmox_vm
+    when:
+      - vm_is_running | default(false) | bool
+      - regenerate_cloudinit_on_running_vm | default(false) | bool
 
-  - name: "Note that a restart is required for the new network settings"
+  - name: "Point out what still has to happen"
     ansible.builtin.debug:
       msg: >-
-        Cloud-Init-Laufwerk neu erzeugt. cloudbase-init liest es erst beim
-        naechsten Start der VM - bis dahin behaelt '{{ vm_config['name'] }}'
-        die bisherige Netzwerkkonfiguration.
-    when: vm_config['name'] in collected_proxmox_vm
+        Cloud-Init-Laufwerk neu erzeugt. Die Konfiguration greift erst beim
+        NEUSTART von '{{ vm_config['name'] }}' - cloudbase-init liest das
+        Laufwerk nur beim Hochfahren. Beim naechsten Start wird ausserdem das
+        lokale Admin-Passwort auf den cipassword-Wert zurueckgesetzt.
+    when:
+      - vm_is_running | default(false) | bool
+      - regenerate_cloudinit_on_running_vm | default(false) | bool
 
   # ---------------------------------------------------------------------------
   # Zustand in NetBox fortschreiben - Custom Field proxmox_status.
