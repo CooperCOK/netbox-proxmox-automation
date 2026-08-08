@@ -326,6 +326,49 @@
     delay: 10
 
   # ---------------------------------------------------------------------------
+  # Cloud-Init-Laufwerk neu erzeugen.
+  #
+  # ZWINGEND, sonst wirkt das oben gesetzte ipconfig0 bei einer bereits
+  # laufenden VM NICHT. Proxmox schreibt geaenderte Cloud-Init-Werte nur in die
+  # VM-Konfiguration; auf das Laufwerk gelangen sie erst beim naechsten
+  # Stop/Start oder durch diesen Aufruf. Bis dahin fuehrt "qm cloudinit pending"
+  # sie als "new" und der Gast liest weiter die alten Daten.
+  #
+  # Bei einer frisch geklonten VM faellt das nicht auf, weil sie ohnehin erst
+  # danach zum ersten Mal startet. Am 08.08.2026 an MGMTADC03 beobachtet:
+  # ipconfig0 in der Config gesetzt, Gast auf APIPA (169.254.x), und
+  # cloudbase-init meldete "NetworkConfigPlugin execution already done,
+  # skipping" - weil die Instanz-ID unveraendert blieb.
+  #
+  # Proxmox leitet die Instanz-ID aus dem INHALT der Cloud-Init-Daten ab
+  # (Cloudinit.pm: cloudbase_gen_instance_id). Nach dem Neuerzeugen ist sie
+  # anders, und cloudbase-init fuehrt beim naechsten Start alle Plugins erneut
+  # aus - das Netzwerk wird also tatsaechlich angewendet.
+  #
+  # NICHT enthalten: ein Neustart. cloudbase-init liest das Laufwerk nur beim
+  # Hochfahren, die neue Konfiguration greift also erst dann. Einen laufenden
+  # Server ungefragt neu zu starten waere hier aber der falsche Automatismus -
+  # das gehoert in die Hand dessen, der die Aenderung veranlasst.
+  # ---------------------------------------------------------------------------
+  - name: "Regenerate the cloud-init drive so the guest actually sees the change"
+    ansible.builtin.uri:
+      url: "{{ pve_api_base }}/nodes/{{ vm_config['node'] }}/qemu/{{ collected_proxmox_vm[vm_config['name']] }}/cloudinit"
+      method: PUT
+      headers: "{{ pve_auth_headers }}"
+      status_code: [200, 204]
+      validate_certs: false
+    no_log: true
+    when: vm_config['name'] in collected_proxmox_vm
+
+  - name: "Note that a restart is required for the new network settings"
+    ansible.builtin.debug:
+      msg: >-
+        Cloud-Init-Laufwerk neu erzeugt. cloudbase-init liest es erst beim
+        naechsten Start der VM - bis dahin behaelt '{{ vm_config['name'] }}'
+        die bisherige Netzwerkkonfiguration.
+    when: vm_config['name'] in collected_proxmox_vm
+
+  # ---------------------------------------------------------------------------
   # Zustand in NetBox fortschreiben - Custom Field proxmox_status.
   #
   # Gleiches Muster wie MaaS_Status bei den Devices. "configure network" ist der
